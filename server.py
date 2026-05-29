@@ -603,6 +603,74 @@ async def proxy_replicate_tryon_start(request: Request):
     )
 
 
+@app.post("/api/fal/tryon/start")
+async def proxy_fal_tryon_start(request: Request):
+    fal_key = env_value("FAL_API_KEY")
+    if not fal_key:
+        return json_response(500, {"error": "FAL_API_KEY is missing"})
+    body = await read_proxy_json_body(request)
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return json_response(400, {"error": "Invalid JSON body"})
+    if not payload.get("human_image_url") or not payload.get("garment_image_url"):
+        return json_response(400, {"error": "human_image_url and garment_image_url are required"})
+    category = payload.get("category", "upper")
+    if category not in {"upper", "lower", "dress"}:
+        category = "upper"
+    upstream_body = json.dumps({
+        "human_image_url": payload["human_image_url"],
+        "garment_image_url": payload["garment_image_url"],
+        "category": category,
+    }).encode("utf-8")
+    return fetch_upstream(
+        "https://queue.fal.run/fal-ai/kling/v1-5/kolors-virtual-try-on",
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Key {fal_key}"},
+        body=upstream_body,
+    )
+
+
+@app.get("/api/fal/tryon/status")
+def proxy_fal_tryon_status(id: str = ""):
+    fal_key = env_value("FAL_API_KEY")
+    if not fal_key:
+        return json_response(500, {"error": "FAL_API_KEY is missing"})
+    if not id:
+        return json_response(400, {"error": "id is required"})
+    safe_id = urllib.parse.quote(id)
+    auth_headers = {"Authorization": f"Key {fal_key}"}
+    status_req = urllib.request.Request(
+        f"https://queue.fal.run/fal-ai/kling/v1-5/kolors-virtual-try-on/requests/{safe_id}/status",
+        headers=auth_headers,
+    )
+    try:
+        with urllib.request.urlopen(status_req, timeout=30) as res:
+            status_data = json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return json_response(exc.code, {"error": exc.read().decode("utf-8", errors="ignore")})
+    except urllib.error.URLError as exc:
+        return json_response(502, {"error": str(exc.reason)})
+
+    status = status_data.get("status", "")
+    if status == "COMPLETED":
+        result_req = urllib.request.Request(
+            f"https://queue.fal.run/fal-ai/kling/v1-5/kolors-virtual-try-on/requests/{safe_id}",
+            headers=auth_headers,
+        )
+        try:
+            with urllib.request.urlopen(result_req, timeout=30) as res:
+                result_data = json.loads(res.read().decode("utf-8"))
+            images = result_data.get("images", [])
+            output_url = images[0].get("url") if images else None
+            return json_response(200, {"status": "COMPLETED", "output_url": output_url})
+        except Exception:
+            return json_response(200, {"status": "COMPLETED", "output_url": None})
+    if status == "FAILED":
+        return json_response(200, {"status": "FAILED", "error": status_data.get("error", "가상 착용 생성 실패")})
+    return json_response(200, {"status": status})
+
+
 @app.get("/api/replicate/tryon/status")
 def proxy_replicate_tryon_status(id: str = ""):
     token = env_value("REPLICATE_API_TOKEN")
