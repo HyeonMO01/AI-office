@@ -1275,6 +1275,32 @@ def propose_office_action(
     return f"[propose_office_action result] Action #{action_id} created with status={status}, type={safe_type}, risk={safe_risk}."
 
 
+_thread_local = threading.local()
+
+
+def ask_colleague(colleague_key: str, question: str) -> str:
+    """Ask another employee a specific question. Used for inter-agent collaboration."""
+    if colleague_key not in employees:
+        return f"[ask_colleague 오류] 존재하지 않는 직원 키: {colleague_key}. 사용 가능: {list(employees.keys())}"
+    depth = getattr(_thread_local, "colleague_depth", 0)
+    if depth >= 1:
+        return "[ask_colleague] 이미 동료 호출 중입니다. 재귀 호출은 허용되지 않습니다."
+    _thread_local.colleague_depth = depth + 1
+    try:
+        result, _ = run_employee(
+            emp_key=colleague_key,
+            task=question,
+            current_context=question,
+            history=[],
+            session_id="colleague_internal",
+            user_key="system",
+        )
+    finally:
+        _thread_local.colleague_depth = depth
+    emp = employees[colleague_key]
+    return f"[{emp['name']}({emp['role']}) 답변]\n{result[:3000]}"
+
+
 tool_definitions = [
     {
         "type": "function",
@@ -1727,32 +1753,6 @@ Rules:
     )
     record_token_usage(session_id, user_key, "manager_routing", model, router_res)
     return parse_task_groups(router_res.choices[0].message.content)
-
-
-_thread_local = threading.local()
-
-
-def ask_colleague(colleague_key: str, question: str) -> str:
-    """Ask another employee a specific question. Used for inter-agent collaboration."""
-    if colleague_key not in employees:
-        return f"[ask_colleague 오류] 존재하지 않는 직원 키: {colleague_key}. 사용 가능: {list(employees.keys())}"
-    depth = getattr(_thread_local, "colleague_depth", 0)
-    if depth >= 1:
-        return "[ask_colleague] 이미 동료 호출 중입니다. 재귀 호출은 허용되지 않습니다."
-    _thread_local.colleague_depth = depth + 1
-    try:
-        result, _ = run_employee(
-            emp_key=colleague_key,
-            task=question,
-            current_context=question,
-            history=[],
-            session_id="colleague_internal",
-            user_key="system",
-        )
-    finally:
-        _thread_local.colleague_depth = depth
-    emp = employees[colleague_key]
-    return f"[{emp['name']}({emp['role']}) 답변]\n{result[:3000]}"
 
 
 REACT_INSTRUCTIONS = """
