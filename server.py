@@ -361,6 +361,20 @@ def init_db() -> None:
                 result TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS office_triggers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trigger_key TEXT NOT NULL UNIQUE,
+                event_type TEXT NOT NULL,
+                keyword TEXT NOT NULL DEFAULT '',
+                employee_keys TEXT NOT NULL,
+                task_template TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                cooldown_minutes INTEGER NOT NULL DEFAULT 60,
+                last_triggered_at TEXT,
+                trigger_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
             """
         )
         conn.execute(
@@ -408,6 +422,43 @@ def init_db() -> None:
                 WHERE job_key = ?
                 """,
                 (title, task, interval_minutes, job_key),
+            )
+
+        default_triggers = [
+            (
+                "on_job_failed",
+                "auto_job_failed",
+                "",
+                json.dumps([EMP_DEVELOPMENT, EMP_ADMIN]),
+                "자동 업무 실패가 감지됐습니다: {detail}\n원인을 분석하고 복구 방안을 제시해주세요.",
+                120,
+            ),
+            (
+                "on_action_approved",
+                "action_approved",
+                "",
+                json.dumps([EMP_DEVELOPMENT]),
+                "창업자가 다음 액션을 승인했습니다: {detail}\n실행 준비 및 체크리스트를 작성해주세요.",
+                30,
+            ),
+            (
+                "on_webhook_error",
+                "webhook",
+                "error",
+                json.dumps([EMP_DEVELOPMENT, EMP_QA]),
+                "외부 시스템에서 오류가 보고됐습니다: {detail}\n영향 범위와 대응 방안을 분석해주세요.",
+                60,
+            ),
+        ]
+        for trigger_key, event_type, keyword, employee_keys, task_template, cooldown_minutes in default_triggers:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO office_triggers
+                    (trigger_key, event_type, keyword, employee_keys, task_template,
+                     enabled, cooldown_minutes, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (trigger_key, event_type, keyword, employee_keys, task_template, cooldown_minutes, now),
             )
 
 
@@ -841,6 +892,64 @@ def token_summary(user_key: str) -> dict[str, Any]:
     }
 
 
+def _fire_trigger(employee_keys: list[str], task: str, session_id: str) -> None:
+    try:
+        run_office_command(task, session_id=session_id, user_key="system_trigger")
+    except Exception as exc:
+        try:
+            log_office_event("trigger_error", f"Trigger execution failed", str(exc))
+        except Exception:
+            pass
+
+
+def process_event_triggers(event_type: str, combined_detail: str) -> None:
+    """Check triggers matching this event and fire agents asynchronously."""
+    try:
+        init_db()
+        now_dt = datetime.now(timezone.utc)
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, trigger_key, employee_keys, task_template, cooldown_minutes, last_triggered_at
+                FROM office_triggers
+                WHERE enabled = 1 AND (event_type = ? OR event_type = '*')
+                  AND (keyword = '' OR ? LIKE '%' || keyword || '%')
+                """,
+                (event_type, combined_detail),
+            ).fetchall()
+
+        for row in rows:
+            last = parse_dt(row["last_triggered_at"])
+            if last:
+                elapsed = (now_dt - last).total_seconds() / 60
+                if elapsed < int(row["cooldown_minutes"]):
+                    continue
+            task = (
+                str(row["task_template"])
+                .replace("{event_type}", event_type)
+                .replace("{detail}", combined_detail[:500])
+            )
+            try:
+                emp_keys = [k for k in json.loads(row["employee_keys"] or "[]") if k in employees]
+            except (json.JSONDecodeError, TypeError):
+                emp_keys = [EMP_ADMIN]
+            if not emp_keys:
+                continue
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE office_triggers SET last_triggered_at = ?, trigger_count = trigger_count + 1 WHERE id = ?",
+                    (now_dt.isoformat(), row["id"]),
+                )
+            session_id = f"trigger-{row['trigger_key']}-{int(now_dt.timestamp())}"
+            threading.Thread(
+                target=_fire_trigger,
+                args=(emp_keys, task, session_id),
+                daemon=True,
+            ).start()
+    except Exception:
+        pass
+
+
 def log_office_event(event_type: str, title: str, detail: str = "") -> None:
     init_db()
     with get_db() as conn:
@@ -851,6 +960,11 @@ def log_office_event(event_type: str, title: str, detail: str = "") -> None:
             """,
             (event_type, title[:180], detail[:4000], utc_now()),
         )
+    threading.Thread(
+        target=process_event_triggers,
+        args=(event_type, f"{title}: {detail}"),
+        daemon=True,
+    ).start()
 
 
 def get_office_overview(user_key: str = "founder", session_id: str = "default") -> dict[str, Any]:
@@ -2133,4 +2247,90 @@ def office_status(user_key: str = "founder", session_id: str = "default"):
         "memory_count": len(get_recent_history(session_id)),
         "session_id": session_id,
     }
+
+
+# ─── Phase 4: Event-driven triggers & webhook ─────────────────────────────────
+
+class TriggerRequest(BaseModel):
+    trigger_key: str = Field(..., description="Unique trigger key")
+    event_type: str = Field(..., description="Event type to match, or '*' for all")
+    keyword: str = Field(default="", description="Optional keyword filter in event detail")
+    employee_keys: list[str] = Field(..., description="Employee keys to fire")
+    task_template: str = Field(..., description="Task text. Use {event_type} and {detail} as placeholders.")
+    cooldown_minutes: int = Field(default=60, ge=1)
+
+
+@app.get("/office/triggers")
+def list_office_triggers():
+    init_db()
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, trigger_key, event_type, keyword, employee_keys, task_template,
+                   enabled, cooldown_minutes, last_triggered_at, trigger_count, created_at
+            FROM office_triggers ORDER BY id ASC
+            """
+        ).fetchall()
+    return {"triggers": [dict(row) for row in rows]}
+
+
+@app.post("/office/triggers")
+def create_office_trigger(req: TriggerRequest):
+    invalid = [k for k in req.employee_keys if k not in employees]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unknown employee keys: {invalid}")
+    init_db()
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO office_triggers
+                (trigger_key, event_type, keyword, employee_keys, task_template,
+                 enabled, cooldown_minutes, created_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                req.trigger_key.strip(),
+                req.event_type.strip(),
+                req.keyword.strip(),
+                json.dumps(req.employee_keys),
+                req.task_template.strip(),
+                req.cooldown_minutes,
+                utc_now(),
+            ),
+        )
+    return {"ok": True, "trigger_key": req.trigger_key}
+
+
+@app.post("/office/triggers/{trigger_id}/toggle")
+def toggle_office_trigger(trigger_id: int, enabled: bool = True):
+    init_db()
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM office_triggers WHERE id = ?", (trigger_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Trigger not found")
+        conn.execute("UPDATE office_triggers SET enabled = ? WHERE id = ?", (1 if enabled else 0, trigger_id))
+    return {"ok": True, "id": trigger_id, "enabled": enabled}
+
+
+@app.delete("/office/triggers/{trigger_id}")
+def delete_office_trigger(trigger_id: int):
+    init_db()
+    with get_db() as conn:
+        conn.execute("DELETE FROM office_triggers WHERE id = ?", (trigger_id,))
+    return {"ok": True, "id": trigger_id}
+
+
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    """Receive external events (Railway, Firebase, monitoring tools, etc.)"""
+    try:
+        body = await request.body()
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return json_response(400, {"error": "Invalid JSON body"})
+    event_type = str(payload.get("event_type") or "webhook").strip()[:60]
+    title = str(payload.get("title") or "External webhook event").strip()[:180]
+    detail = str(payload.get("detail") or "").strip()[:4000]
+    log_office_event(event_type, title, detail)
+    return json_response(200, {"ok": True, "event_type": event_type, "triggered_at": utc_now()})
 
