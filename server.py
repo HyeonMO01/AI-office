@@ -1066,6 +1066,63 @@ def save_business_doc(filename: str, content: str) -> str:
     return f"[save_business_doc 결과] fizzylush 문서를 저장했습니다: {output_path.as_posix()}"
 
 
+def think(thought: str) -> str:
+    """Record a reasoning/planning step before acting."""
+    return f"[Thought recorded] {thought}"
+
+
+def mark_complete(summary: str) -> str:
+    """Signal that the task is complete with a summary."""
+    return f"[TASK_COMPLETE] {summary}"
+
+
+def read_project_file(path: str) -> str:
+    """Read a file from the fizzylush project to understand current code state."""
+    normalized = Path(path).as_posix().lstrip("/")
+    if ".." in normalized:
+        return f"[read_project_file 오류] 접근 불가 경로: {path}"
+    safe_prefixes = (
+        "PJ01/src/", "PJ01/docs/", "PJ01/package.json", "PJ01/app.json",
+        "PJ01/eas.json", "server.py", "requirements.txt",
+    )
+    if not any(normalized.startswith(p) for p in safe_prefixes):
+        return f"[read_project_file 오류] 허용되지 않는 경로: {path}"
+    file_path = Path(normalized)
+    if not file_path.exists():
+        return f"[read_project_file 오류] 파일 없음: {path}"
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+        if len(content) > 8000:
+            content = content[:8000] + "\n...(너무 길어 잘렸습니다)"
+        return f"[read_project_file 결과] {path}\n\n{content}"
+    except Exception as exc:
+        return f"[read_project_file 오류] {exc}"
+
+
+def search_web(query: str) -> str:
+    """Search the web for real-time information using DuckDuckGo."""
+    try:
+        params = urllib.parse.urlencode({"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
+        req = urllib.request.Request(
+            f"https://api.duckduckgo.com/?{params}",
+            headers={"User-Agent": "Mozilla/5.0 fizzylush-ai-office/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as res:
+            data = json.loads(res.read().decode("utf-8"))
+        results: list[str] = []
+        abstract = (data.get("AbstractText") or "").strip()
+        if abstract:
+            results.append(f"요약: {abstract}")
+        for item in (data.get("RelatedTopics") or [])[:5]:
+            if isinstance(item, dict) and item.get("Text"):
+                results.append(f"- {str(item['Text'])[:200]}")
+        if not results:
+            return f"[search_web] '{query}'에 대한 결과를 찾지 못했습니다."
+        return f"[search_web 결과] '{query}'\n" + "\n".join(results)
+    except Exception as exc:
+        return f"[search_web 오류] {exc}"
+
+
 def propose_office_action(
     action_type: str,
     title: str,
@@ -1104,6 +1161,66 @@ def propose_office_action(
 
 
 tool_definitions = [
+    {
+        "type": "function",
+        "function": {
+            "name": "think",
+            "description": "Record your reasoning and planning before taking action. Use this before every action to think step by step.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought": {"type": "string", "description": "Your reasoning, analysis, or next-step plan."},
+                },
+                "required": ["thought"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mark_complete",
+            "description": "Signal that the task is fully complete. Call this only when all work is done.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "Summary of everything accomplished."},
+                },
+                "required": ["summary"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_project_file",
+            "description": "Read a source file from the fizzylush project to understand the current code state before suggesting changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path, e.g. 'PJ01/src/screens/HomeScreen.tsx' or 'server.py'."},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web for real-time information about competitors, market trends, technologies, or any topic.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query."},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -1212,6 +1329,10 @@ tool_definitions = [
 
 
 available_functions = {
+    "think": think,
+    "mark_complete": mark_complete,
+    "read_project_file": read_project_file,
+    "search_web": search_web,
     "search_fashion_market": search_fashion_market,
     "analyze_fizzylush_project": analyze_fizzylush_project,
     "create_launch_checklist": create_launch_checklist,
@@ -1319,6 +1440,20 @@ Rules:
     return parse_task_sequence(router_res.choices[0].message.content)
 
 
+REACT_INSTRUCTIONS = """
+작업 방식 — ReAct 패턴 (Reasoning + Acting):
+1. 행동 전 반드시 think 툴로 무엇을 할지 먼저 생각하세요.
+2. 필요한 툴을 호출해 실제 작업을 실행하세요.
+3. 툴 결과를 확인하고 다음 단계를 계획하세요.
+4. 필요하면 read_project_file로 실제 코드를 읽고, search_web으로 실시간 정보를 조회하세요.
+5. 모든 작업이 완료되면 mark_complete를 호출하세요.
+
+한 번에 끝내려 하지 말고, 단계적으로 생각하며 실행하세요.
+"""
+
+REACT_MAX_ITERATIONS = 10
+
+
 def run_employee(
     emp_key: str,
     task: str,
@@ -1338,29 +1473,27 @@ Original user command:
 Previous employee result or current context:
 {current_context}
 
-Do the next part of the work according to your role.
-Use fizzylush context and make the output concrete enough for the founder to execute.
+{REACT_INSTRUCTIONS}
 
-Use tools when useful:
-- search_fashion_market: market, competitor, and trend assumptions
-- analyze_fizzylush_project: app/project structure context
-- create_launch_checklist: launch execution checklist
-- save_business_doc: durable business, launch, or marketing documents
+Available tools:
+- think: 행동 전 추론 기록 (필수)
+- mark_complete: 작업 완료 신호
+- read_project_file: 실제 프로젝트 파일 읽기
+- search_web: 실시간 웹 검색
+- search_fashion_market: 패션 시장 리서치
+- analyze_fizzylush_project: 앱 구조 분석
+- create_launch_checklist: 런칭 체크리스트
+- save_business_doc: 문서 저장
+- propose_office_action: 승인 필요 액션 등록
 
 Guardrail:
-Prepare recommendations and artifacts, but do not claim that real app deployment,
-paid ads, customer messaging, legal publication, or production data changes were executed.
-Those require founder approval.
+실제 배포, 유료 광고, 고객 메시지, 법적 게시, 프로덕션 DB 변경은 창업자 승인 필요.
 
-Required reporting format:
+최종 보고 형식:
 1. 실제 완료
 2. 준비된 초안/제안
 3. 승인 필요
 4. 다음 실행
-
-Use "실제 완료: 없음" if no real execution happened.
-Use "검증 필요" for anything that has not been tested in the running app or real service.
-Use "등록됨" for approval queue actions, not "실행됨".
 
 Always answer in Korean.
 """
@@ -1371,10 +1504,10 @@ Always answer in Korean.
         {"role": "user", "content": work_prompt},
     ]
 
-    # Tool-calling loop. The model can request a tool, we run it, then send
-    # the tool result back to the model so it can produce the final answer.
-    for _ in range(3):
-        model = "gpt-4o-mini"
+    model = "gpt-4o-mini"
+    completed = False
+
+    for iteration in range(REACT_MAX_ITERATIONS):
         response = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -1396,27 +1529,32 @@ Always answer in Korean.
             except json.JSONDecodeError:
                 arguments = {}
 
+            if function_name == "mark_complete":
+                completed = True
+
             tool_result = run_tool_call(function_name, arguments)
-            tool_logs.append(
-                {
+
+            if function_name != "think":
+                tool_logs.append({
                     "employee": emp["name"],
                     "function": function_name,
                     "arguments": json.dumps(arguments, ensure_ascii=False),
                     "result": tool_result,
-                }
-            )
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_result,
-                }
-            )
+                })
 
-    return (
-        "Tool calls repeated too many times. Please make the command more specific.",
-        tool_logs,
-    )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": tool_result,
+            })
+
+        if completed:
+            messages.append({"role": "user", "content": "작업이 완료됐습니다. 최종 결과를 한국어로 정리해주세요."})
+            final_res = client.chat.completions.create(model=model, messages=messages)
+            record_token_usage(session_id, user_key, EMP_AREA.get(emp_key, "employee_unknown"), model, final_res)
+            return final_res.choices[0].message.content or "", tool_logs
+
+    return "최대 반복 횟수에 도달했습니다. 더 구체적인 명령을 입력해주세요.", tool_logs
 
 
 def run_office_command(task: str, session_id: str = "default", user_key: str = "founder") -> dict[str, Any]:
