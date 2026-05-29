@@ -1402,6 +1402,86 @@ def parse_task_groups(raw_content: str | None) -> list[list[str]]:
     return groups or [[EMP_PLANNING]]
 
 
+EVAL_PASS_THRESHOLD = 6
+EVAL_MAX_RETRIES = 1  # 최대 1회 재시도 (총 2회 시도)
+
+
+def evaluate_result(emp_key: str, task: str, result: str) -> dict[str, Any]:
+    """Evaluate the quality of an employee's work. Returns pass/fail, score, feedback."""
+    client = get_openai_client()
+    emp = employees[emp_key]
+    eval_prompt = (
+        f"당신은 AI 직원 작업 결과를 평가하는 품질 검사관입니다.\n\n"
+        f"직원 역할: {emp['role']}\n"
+        f"원래 명령: {task[:500]}\n"
+        f"작업 결과: {result[:2000]}\n\n"
+        "다음 기준으로 1~10점 평가하세요:\n"
+        "1. 명령에 직접 응답했는가 (관련성)\n"
+        "2. 결과가 구체적이고 실행 가능한가 (구체성)\n"
+        "3. 한국어로 작성됐는가 (언어)\n"
+        "4. 내용이 충분한가 (완성도)\n"
+        "5. 검증 안 된 주장에 '검증 필요'를 붙였는가 (정확성)\n\n"
+        '{"passed": true/false, "score": 1-10, "feedback": "개선점 (통과 시 빈 문자열)"} 형식으로만 응답하세요.'
+    )
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": eval_prompt}],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(response.choices[0].message.content or "{}")
+        score = int(data.get("score", 7))
+        return {
+            "passed": score >= EVAL_PASS_THRESHOLD,
+            "score": score,
+            "feedback": str(data.get("feedback", "")),
+        }
+    except Exception:
+        return {"passed": True, "score": 7, "feedback": ""}
+
+
+def run_employee_with_eval(
+    emp_key: str,
+    task: str,
+    current_context: str,
+    history: list[dict[str, str]],
+    session_id: str,
+    user_key: str,
+) -> tuple[str, list[dict[str, str]], list[dict[str, Any]]]:
+    """Run an employee with automatic quality evaluation and retry on failure."""
+    eval_logs: list[dict[str, Any]] = []
+    ctx = current_context
+    result = ""
+    all_tool_logs: list[dict[str, str]] = []
+
+    for attempt in range(EVAL_MAX_RETRIES + 1):
+        result, tool_logs = run_employee(emp_key, task, ctx, history, session_id, user_key)
+        all_tool_logs.extend(tool_logs)
+
+        evaluation = evaluate_result(emp_key, task, result)
+        eval_logs.append({
+            "employee": employees[emp_key]["name"],
+            "role": employees[emp_key]["role"],
+            "attempt": attempt + 1,
+            "score": evaluation["score"],
+            "passed": evaluation["passed"],
+            "feedback": evaluation["feedback"],
+        })
+
+        if evaluation["passed"] or attempt == EVAL_MAX_RETRIES:
+            break
+
+        ctx = (
+            f"{current_context}\n\n"
+            f"[재작업 요청 — 시도 {attempt + 1} 품질 미달 (점수: {evaluation['score']}/10)]\n"
+            f"개선 필요: {evaluation['feedback']}\n"
+            "위 피드백을 반드시 반영해 더 구체적이고 실행 가능한 결과를 작성하세요."
+        )
+
+    return result, all_tool_logs, eval_logs
+
+
 def synthesize_parallel_results(task: str, results: dict[str, str]) -> str:
     """Merge results from parallel employees into one coherent report."""
     client = get_openai_client()
@@ -1431,30 +1511,32 @@ def run_employees_parallel(
     history: list[dict[str, str]],
     session_id: str,
     user_key: str,
-) -> tuple[str, list[dict[str, str]]]:
-    """Run a group of employees in parallel and synthesize their results."""
+) -> tuple[str, list[dict[str, str]], list[dict[str, Any]]]:
+    """Run a group of employees in parallel with evaluation, then synthesize results."""
     if len(emp_keys) == 1:
-        return run_employee(emp_keys[0], task, current_context, history, session_id, user_key)
+        return run_employee_with_eval(emp_keys[0], task, current_context, history, session_id, user_key)
 
     all_tool_logs: list[dict[str, str]] = []
+    all_eval_logs: list[dict[str, Any]] = []
     results: dict[str, str] = {}
 
     with ThreadPoolExecutor(max_workers=len(emp_keys)) as executor:
         futures = {
-            executor.submit(run_employee, key, task, current_context, history, session_id, user_key): key
+            executor.submit(run_employee_with_eval, key, task, current_context, history, session_id, user_key): key
             for key in emp_keys
         }
         for future in as_completed(futures):
             key = futures[future]
             try:
-                result, tool_logs = future.result()
+                result, tool_logs, eval_logs = future.result()
                 results[key] = result
                 all_tool_logs.extend(tool_logs)
+                all_eval_logs.extend(eval_logs)
             except Exception as exc:
                 results[key] = f"[오류] {exc}"
 
     synthesized = synthesize_parallel_results(task, results)
-    return synthesized, all_tool_logs
+    return synthesized, all_tool_logs, all_eval_logs
 
 
 def quick_route(task: str) -> list[list[str]] | None:
@@ -1685,6 +1767,7 @@ def run_office_command(task: str, session_id: str = "default", user_key: str = "
     current_context = task
     worked_employees: list[str] = []
     all_tool_logs: list[dict[str, str]] = []
+    all_eval_logs: list[dict[str, Any]] = []
     execution_plan: list[list[str]] = []
 
     for group in task_groups:
@@ -1692,7 +1775,7 @@ def run_office_command(task: str, session_id: str = "default", user_key: str = "
         worked_employees.extend(group_names)
         execution_plan.append(group_names)
 
-        current_context, tool_logs = run_employees_parallel(
+        current_context, tool_logs, eval_logs = run_employees_parallel(
             emp_keys=group,
             task=task,
             current_context=current_context,
@@ -1701,6 +1784,7 @@ def run_office_command(task: str, session_id: str = "default", user_key: str = "
             user_key=user_key,
         )
         all_tool_logs.extend(tool_logs)
+        all_eval_logs.extend(eval_logs)
 
     remember(session_id, "user", task)
     remember(session_id, "assistant", current_context)
@@ -1714,6 +1798,7 @@ def run_office_command(task: str, session_id: str = "default", user_key: str = "
         "role": "\uc791\uc5c5 \ud504\ub85c\uc81d\ud2b8",
         "result": current_context,
         "tool_logs": all_tool_logs,
+        "evaluation_logs": all_eval_logs,
         "memory_count": len(chat_history.get(session_id, [])),
         "token_summary": token_summary(user_key),
     }
