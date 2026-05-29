@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1224,6 +1225,28 @@ tool_definitions = [
     {
         "type": "function",
         "function": {
+            "name": "ask_colleague",
+            "description": "Ask another employee a specific question to collaborate. Use when you need expertise from a different role.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "colleague_key": {
+                        "type": "string",
+                        "description": f"Employee key to ask. Options: {list(employees.keys()) if employees else '기획,리서치,번역,분석,총무,개발,검수,배포,집행,법무'}",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "The specific question or sub-task for the colleague.",
+                    },
+                },
+                "required": ["colleague_key", "question"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_fashion_market",
             "description": "Fizzylush launch research helper for fashion, AI styling, shopping, and competitor context. Dummy structured research, not live internet.",
             "parameters": {
@@ -1331,6 +1354,7 @@ tool_definitions = [
 available_functions = {
     "think": think,
     "mark_complete": mark_complete,
+    "ask_colleague": ask_colleague,
     "read_project_file": read_project_file,
     "search_web": search_web,
     "search_fashion_market": search_fashion_market,
@@ -1353,41 +1377,106 @@ def run_tool_call(function_name: str, arguments: dict[str, Any]) -> str:
 
 
 def parse_task_sequence(raw_content: str | None) -> list[str]:
-    if not raw_content:
-        return [EMP_PLANNING]
+    groups = parse_task_groups(raw_content)
+    return [key for group in groups for key in group]
 
+
+def parse_task_groups(raw_content: str | None) -> list[list[str]]:
+    """Parse manager output into parallel groups. Supports both flat and grouped formats."""
+    if not raw_content:
+        return [[EMP_PLANNING]]
     try:
         parsed = json.loads(raw_content)
     except json.JSONDecodeError:
-        return [EMP_PLANNING]
-
+        return [[EMP_PLANNING]]
     if not isinstance(parsed, list):
-        return [EMP_PLANNING]
+        return [[EMP_PLANNING]]
+    groups: list[list[str]] = []
+    for item in parsed:
+        if isinstance(item, list):
+            valid = [k for k in item if k in employees]
+            if valid:
+                groups.append(valid)
+        elif isinstance(item, str) and item in employees:
+            groups.append([item])
+    return groups or [[EMP_PLANNING]]
 
-    sequence = [item for item in parsed if item in employees]
-    return sequence or [EMP_PLANNING]
+
+def synthesize_parallel_results(task: str, results: dict[str, str]) -> str:
+    """Merge results from parallel employees into one coherent report."""
+    client = get_openai_client()
+    combined = "\n\n".join(
+        f"### {employees[k]['name']} ({employees[k]['role']}):\n{v}"
+        for k, v in results.items()
+    )
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{
+            "role": "user",
+            "content": (
+                f"다음은 여러 AI 직원들이 동시에 수행한 작업 결과입니다.\n"
+                f"원래 명령: {task}\n\n{combined}\n\n"
+                "위 결과들을 하나의 통합 보고서로 합쳐주세요. "
+                "중복은 제거하고 각 직원의 핵심 기여를 보존하세요. 한국어로 작성하세요."
+            ),
+        }],
+    )
+    return response.choices[0].message.content or combined
 
 
-def quick_route(task: str) -> list[str] | None:
+def run_employees_parallel(
+    emp_keys: list[str],
+    task: str,
+    current_context: str,
+    history: list[dict[str, str]],
+    session_id: str,
+    user_key: str,
+) -> tuple[str, list[dict[str, str]]]:
+    """Run a group of employees in parallel and synthesize their results."""
+    if len(emp_keys) == 1:
+        return run_employee(emp_keys[0], task, current_context, history, session_id, user_key)
+
+    all_tool_logs: list[dict[str, str]] = []
+    results: dict[str, str] = {}
+
+    with ThreadPoolExecutor(max_workers=len(emp_keys)) as executor:
+        futures = {
+            executor.submit(run_employee, key, task, current_context, history, session_id, user_key): key
+            for key in emp_keys
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                result, tool_logs = future.result()
+                results[key] = result
+                all_tool_logs.extend(tool_logs)
+            except Exception as exc:
+                results[key] = f"[오류] {exc}"
+
+    synthesized = synthesize_parallel_results(task, results)
+    return synthesized, all_tool_logs
+
+
+def quick_route(task: str) -> list[list[str]] | None:
     normalized = task.lower()
     if any(word in normalized for word in ["code", "bug", "fix", "dev", "develop"]):
-        return [EMP_DEVELOPMENT, EMP_QA]
+        return [[EMP_DEVELOPMENT, EMP_QA]]
     if any(word in normalized for word in ["test", "qa", "lint", "build"]):
-        return [EMP_QA, EMP_DEVELOPMENT]
+        return [[EMP_QA, EMP_DEVELOPMENT]]
     if any(word in normalized for word in ["deploy", "release", "eas", "store", "submit", "upload"]):
-        return [EMP_DEPLOYMENT, EMP_QA, EMP_ADMIN]
+        return [[EMP_DEPLOYMENT, EMP_QA], [EMP_ADMIN]]
     if any(word in normalized for word in ["ads", "campaign", "customer", "message", "growth"]):
-        return [EMP_GROWTH, EMP_TRANSLATION, EMP_ANALYSIS]
+        return [[EMP_GROWTH, EMP_TRANSLATION], [EMP_ANALYSIS]]
     if any(word in normalized for word in ["legal", "privacy", "terms", "policy", "compliance"]):
-        return [EMP_LEGAL, EMP_ADMIN]
+        return [[EMP_LEGAL, EMP_ADMIN]]
     if any(word in normalized for word in ["status", "summary"]):
-        return [EMP_ANALYSIS]
+        return [[EMP_ANALYSIS]]
     if any(word in normalized for word in ["save", "checklist", "document"]):
-        return [EMP_ADMIN]
+        return [[EMP_ADMIN]]
     return None
 
 
-def ask_manager(task: str, history: list[dict[str, str]], session_id: str, user_key: str) -> list[str]:
+def ask_manager(task: str, history: list[dict[str, str]], session_id: str, user_key: str) -> list[list[str]]:
     routed = quick_route(task)
     if routed is not None:
         return routed
@@ -1419,9 +1508,13 @@ Routing guidance:
   ["{EMP_RESEARCH}", "{EMP_PLANNING}", "{EMP_DEVELOPMENT}", "{EMP_QA}", "{EMP_ANALYSIS}", "{EMP_TRANSLATION}", "{EMP_DEPLOYMENT}", "{EMP_GROWTH}", "{EMP_LEGAL}", "{EMP_ADMIN}"].
 
 Rules:
-- Output only a JSON array.
+- Output only a JSON array of groups. Each group is an array of employee keys that can run IN PARALLEL.
+- Groups run sequentially in order, but employees within the same group run in parallel.
+- Put independent employees (who don't need each other's output) in the same group.
+- Put dependent employees (who need previous results) in separate groups.
 - Use only keys from the employee list.
 - Do not write markdown, code fences, or explanations.
+- Example: [["리서치", "기획"], ["분석"], ["총무"]] means 리서치+기획 run in parallel first, then 분석, then 총무.
 """
 
     messages = [
@@ -1437,7 +1530,33 @@ Rules:
         temperature=0,
     )
     record_token_usage(session_id, user_key, "manager_routing", model, router_res)
-    return parse_task_sequence(router_res.choices[0].message.content)
+    return parse_task_groups(router_res.choices[0].message.content)
+
+
+_thread_local = threading.local()
+
+
+def ask_colleague(colleague_key: str, question: str) -> str:
+    """Ask another employee a specific question. Used for inter-agent collaboration."""
+    if colleague_key not in employees:
+        return f"[ask_colleague 오류] 존재하지 않는 직원 키: {colleague_key}. 사용 가능: {list(employees.keys())}"
+    depth = getattr(_thread_local, "colleague_depth", 0)
+    if depth >= 1:
+        return "[ask_colleague] 이미 동료 호출 중입니다. 재귀 호출은 허용되지 않습니다."
+    _thread_local.colleague_depth = depth + 1
+    try:
+        result, _ = run_employee(
+            emp_key=colleague_key,
+            task=question,
+            current_context=question,
+            history=[],
+            session_id="colleague_internal",
+            user_key="system",
+        )
+    finally:
+        _thread_local.colleague_depth = depth
+    emp = employees[colleague_key]
+    return f"[{emp['name']}({emp['role']}) 답변]\n{result[:3000]}"
 
 
 REACT_INSTRUCTIONS = """
@@ -1484,6 +1603,7 @@ Available tools:
 - analyze_fizzylush_project: 앱 구조 분석
 - create_launch_checklist: 런칭 체크리스트
 - save_business_doc: 문서 저장
+- ask_colleague: 다른 직원에게 질문/협업 요청
 - propose_office_action: 승인 필요 액션 등록
 
 Guardrail:
@@ -1560,18 +1680,20 @@ Always answer in Korean.
 def run_office_command(task: str, session_id: str = "default", user_key: str = "founder") -> dict[str, Any]:
     ensure_office_user(user_key)
     history = get_recent_history(session_id)
-    task_sequence = ask_manager(task, history, session_id, user_key)
+    task_groups = ask_manager(task, history, session_id, user_key)
 
     current_context = task
-    worked_employees = []
-    all_tool_logs = []
+    worked_employees: list[str] = []
+    all_tool_logs: list[dict[str, str]] = []
+    execution_plan: list[list[str]] = []
 
-    for emp_key in task_sequence:
-        emp = employees[emp_key]
-        worked_employees.append(emp["name"])
+    for group in task_groups:
+        group_names = [employees[k]["name"] for k in group]
+        worked_employees.extend(group_names)
+        execution_plan.append(group_names)
 
-        current_context, tool_logs = run_employee(
-            emp_key=emp_key,
+        current_context, tool_logs = run_employees_parallel(
+            emp_keys=group,
             task=task,
             current_context=current_context,
             history=history,
@@ -1585,8 +1707,10 @@ def run_office_command(task: str, session_id: str = "default", user_key: str = "
 
     return {
         "session_id": session_id,
-        "employee": " -> ".join(worked_employees),
-        "task_sequence": task_sequence,
+        "employee": " -> ".join(
+            f"[{'+'.join(g)}]" if len(g) > 1 else g[0] for g in execution_plan
+        ),
+        "task_groups": execution_plan,
         "role": "\uc791\uc5c5 \ud504\ub85c\uc81d\ud2b8",
         "result": current_context,
         "tool_logs": all_tool_logs,
