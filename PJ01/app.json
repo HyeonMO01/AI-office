@@ -1,0 +1,41 @@
+{
+  "expo": {
+    "name": "FIZZYLUSH",
+    "slug": "fizzylush",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.fizzylush.app"
+    },
+    "android": {
+      "package": "com.fizzylush.app",
+      "permissions": [
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE"
+      ]
+    },
+    "plugins": [
+      "expo-image-picker",
+      "expo-font",
+      "@sentry/react-native",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#FF5C8A",
+          "defaultChannel": "default"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "23d09349-87d2-4356-b226-4e813d55e8b1"
+      }
+    }
+  }
+}

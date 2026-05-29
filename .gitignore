@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 data/
 generated_files/
+node_modules/
+.expo/
+dist/
+*.log

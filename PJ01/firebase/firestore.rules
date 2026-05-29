@@ -1,0 +1,12 @@
+rules_version = '2';
+
+// 프로덕션 배포 전 Firebase 콘솔에 이 규칙을 반영하세요.
+// 개발 중 테스트 전용으로 전체 개방(allow read, write: if true)을 쓰고 있다면 반드시 교체하세요.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userId}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}

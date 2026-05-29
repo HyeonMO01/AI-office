@@ -1,0 +1,11 @@
+rules_version = '2';
+
+// 프로덕션: 인증된 사용자만 자신의 users/{uid}/... 경로에 읽기·쓰기
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /users/{userId}/{allPaths=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}
