@@ -74,16 +74,20 @@ function naverApiErrorMessage(data: NaverShoppingResponse): string | undefined {
  * 네이버 쇼핑 검색. 실패 시 `error`에 이유가 담기고 `products`는 빈 배열.
  * (과거에는 예외를 삼켜 빈 배열만 반환해 원인 파악이 불가능했음.)
  */
+export type ShoppingMall = "all" | "musinsa" | "musinsa_standard" | "29cm" | "ably";
+
 export async function fetchNaverShoppingProducts(
   query: string,
   count = 8,
-  options?: { budget?: string; sort?: "sim" | "asc" | "dsc" | "date" },
+  options?: { budget?: string; sort?: "sim" | "asc" | "dsc" | "date"; mall?: ShoppingMall },
 ): Promise<NaverProductsFetchResult> {
   try {
     const n = Math.max(1, Math.min(20, count));
     const sort = options?.sort || "sim";
+    const mall = options?.mall && options.mall !== "all" ? options.mall : "";
+    const mallParam = mall ? `&mall=${encodeURIComponent(mall)}` : "";
     const data = await proxyGet<NaverShoppingResponse>(
-      `/api/naver/shop-search?query=${encodeURIComponent(query)}&display=${n}&sort=${sort}`,
+      `/api/naver/shop-search?query=${encodeURIComponent(query)}&display=${n}&sort=${sort}${mallParam}`,
       NAVER_PROXY_GET_OPTS,
     );
 

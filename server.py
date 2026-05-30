@@ -596,8 +596,29 @@ async def proxy_openai_image_generation(request: Request):
     )
 
 
+MALL_PRESETS: dict[str, dict] = {
+    "musinsa":          {"prefix": "무신사",         "keywords": ["무신사", "musinsa"]},
+    "musinsa_standard": {"prefix": "무신사스탠다드",   "keywords": ["무신사스탠다드", "musinsa standard"]},
+    "29cm":             {"prefix": "29CM",           "keywords": ["29cm", "29CM"]},
+    "ably":             {"prefix": "에이블리",        "keywords": ["에이블리", "ably"]},
+}
+
+
+def _naver_search_raw(query: str, display: int, sort: str, client_id: str, client_secret: str) -> list[dict]:
+    params = urllib.parse.urlencode({"query": query, "display": str(display), "sort": sort})
+    req = urllib.request.Request(
+        f"https://openapi.naver.com/v1/search/shop.json?{params}",
+        headers={"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as res:
+            return json.loads(res.read().decode("utf-8")).get("items", [])
+    except Exception:
+        return []
+
+
 @app.get("/api/naver/shop-search")
-def proxy_naver_shop_search(query: str = "", display: int = 5, sort: str = "sim"):
+def proxy_naver_shop_search(query: str = "", display: int = 5, sort: str = "sim", mall: str = ""):
     client_id = env_value("NAVER_SHOPPING_CLIENT_ID", "EXPO_PUBLIC_NAVER_SHOPPING_CLIENT_ID")
     client_secret = env_value("NAVER_SHOPPING_CLIENT_SECRET", "EXPO_PUBLIC_NAVER_SHOPPING_CLIENT_SECRET")
     if not client_id or not client_secret:
@@ -607,19 +628,38 @@ def proxy_naver_shop_search(query: str = "", display: int = 5, sort: str = "sim"
         return json_response(400, {"error": "Invalid query"})
     safe_display = max(1, min(20, int(display or 5)))
     safe_sort = sort if sort in ALLOWED_NAVER_SORTS else "sim"
-    params = urllib.parse.urlencode(
-        {
-            "query": query,
-            "display": str(safe_display),
-            "sort": safe_sort,
-        }
-    )
+
+    preset = MALL_PRESETS.get(mall.lower().strip())
+
+    if preset:
+        # 무신사 등 특정 쇼핑몰 필터: 접두어 붙인 쿼리로 더 많이 가져와서 mallName 필터링
+        prefixed_query = f"{preset['prefix']} {query}"
+        items = _naver_search_raw(prefixed_query, min(safe_display * 4, 40), safe_sort, client_id, client_secret)
+
+        keywords = [k.lower() for k in preset["keywords"]]
+        filtered = [
+            item for item in items
+            if any(kw in (item.get("mallName") or "").lower() for kw in keywords)
+        ]
+
+        # 필터링 결과가 부족하면 원본 쿼리로도 추가 검색
+        if len(filtered) < safe_display:
+            extra = _naver_search_raw(query, min(safe_display * 4, 40), safe_sort, client_id, client_secret)
+            seen = {item.get("productId") for item in filtered}
+            for item in extra:
+                if any(kw in (item.get("mallName") or "").lower() for kw in keywords):
+                    if item.get("productId") not in seen:
+                        filtered.append(item)
+                        seen.add(item.get("productId"))
+
+        result_items = filtered[:safe_display]
+        return json_response(200, {"items": result_items, "total": len(result_items), "mall": mall})
+
+    # 일반 검색 (mall 파라미터 없음)
+    params = urllib.parse.urlencode({"query": query, "display": str(safe_display), "sort": safe_sort})
     return fetch_upstream(
         f"https://openapi.naver.com/v1/search/shop.json?{params}",
-        headers={
-            "X-Naver-Client-Id": client_id,
-            "X-Naver-Client-Secret": client_secret,
-        },
+        headers={"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret},
     )
 
 

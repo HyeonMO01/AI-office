@@ -15,7 +15,7 @@ import { useFocusEffect } from "@react-navigation/native";
 import { Ionicons } from "@expo/vector-icons";
 import { useAuth } from "../hooks/useAuth";
 import { getUserProfile } from "../services/userProfileService";
-import { fetchNaverShoppingProducts } from "../services/naverShoppingService";
+import { fetchNaverShoppingProducts, ShoppingMall } from "../services/naverShoppingService";
 import { useWardrobeList } from "../hooks/useWardrobeList";
 import { colors, radius } from "../theme";
 import { ShoppingProduct } from "../types";
@@ -36,6 +36,12 @@ export function ShoppingRecommendScreen(): React.JSX.Element {
   const [initialLoading, setInitialLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [selectedMall, setSelectedMall] = useState<ShoppingMall>("all");
+
+  const MALL_TABS: { label: string; value: ShoppingMall }[] = [
+    { label: "전체", value: "all" },
+    { label: "무신사", value: "musinsa" },
+  ];
 
   const buildCategories = useCallback(async () => {
     const profile = user ? await getUserProfile(user.uid) : null;
@@ -63,20 +69,24 @@ export function ShoppingRecommendScreen(): React.JSX.Element {
 
   useFocusEffect(useCallback(() => { void buildCategories(); }, [buildCategories]));
 
-  const fetchProducts = async (query: string) => {
+  const fetchProducts = async (query: string, mall: ShoppingMall = selectedMall) => {
     setLoading(true);
     setError(null);
-    const { products, error } = await fetchNaverShoppingProducts(query, 20);
+    const { products, error } = await fetchNaverShoppingProducts(query, 20, { mall });
     setProducts(products);
-    if (error) {
-      setError(error);
-    }
+    if (error) setError(error);
     setLoading(false);
   };
 
   const handleCategoryPress = (cat: RecommendCategory) => {
     setActiveCategory(cat.label);
     void fetchProducts(cat.query);
+  };
+
+  const handleMallPress = (mall: ShoppingMall) => {
+    setSelectedMall(mall);
+    const active = categories.find((c) => c.label === activeCategory);
+    if (active) void fetchProducts(active.query, mall);
   };
 
   const handleRefresh = async () => {
@@ -122,8 +132,25 @@ export function ShoppingRecommendScreen(): React.JSX.Element {
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
       <View style={styles.headerWrap}>
-        <Text style={styles.pageTitle}>추천</Text>
-        <Text style={styles.pageSub}>내 스타일에 맞는 아이템을 추천해드려요</Text>
+        <View style={styles.headerRow}>
+          <View>
+            <Text style={styles.pageTitle}>추천</Text>
+            <Text style={styles.pageSub}>내 스타일에 맞는 아이템을 추천해드려요</Text>
+          </View>
+          <View style={styles.mallToggle}>
+            {MALL_TABS.map((tab) => (
+              <Pressable
+                key={tab.value}
+                style={[styles.mallTab, selectedMall === tab.value && styles.mallTabActive]}
+                onPress={() => handleMallPress(tab.value)}
+              >
+                <Text style={[styles.mallTabText, selectedMall === tab.value && styles.mallTabTextActive]}>
+                  {tab.label}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
       </View>
 
       <View>
@@ -198,8 +225,22 @@ const styles = StyleSheet.create({
   centerWrap: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
 
   headerWrap: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 4 },
+  headerRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   pageTitle: { fontSize: 22, fontWeight: "700", color: colors.zinc900, letterSpacing: -0.5 },
   pageSub: { fontSize: 13, color: colors.zinc400, marginTop: 4 },
+  mallToggle: {
+    flexDirection: "row",
+    backgroundColor: colors.zinc100,
+    borderRadius: radius.full,
+    padding: 3,
+  },
+  mallTab: {
+    paddingVertical: 6, paddingHorizontal: 14,
+    borderRadius: radius.full,
+  },
+  mallTabActive: { backgroundColor: colors.zinc900 },
+  mallTabText: { fontSize: 12, fontWeight: "600", color: colors.zinc500 },
+  mallTabTextActive: { color: "#fff" },
 
   catScroll: { paddingHorizontal: 20, paddingVertical: 12, gap: 8 },
   catChip: {
