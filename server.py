@@ -47,6 +47,9 @@ ALLOWED_NAVER_SORTS = {"sim", "date", "asc", "dsc"}
 MAX_PROXY_BODY_BYTES = 50 * 1024 * 1024
 AUTO_OFFICE_POLL_SECONDS = 60
 
+# 직원별 모델 — 정밀도가 중요한 직무는 gpt-4o, 속도가 중요한 직무는 mini
+EMP_MODELS: dict[str, str] = {}  # populated after EMP constants are defined
+
 
 EMP_PLANNING = "\uae30\ud68d"
 EMP_RESEARCH = "\ub9ac\uc11c\uce58"
@@ -58,6 +61,21 @@ EMP_QA = "\uac80\uc218"
 EMP_DEPLOYMENT = "\ubc30\ud3ec"
 EMP_GROWTH = "\uc9d1\ud589"
 EMP_LEGAL = "\ubc95\ubb34"
+
+# \ubaa8\ub378 \ub77c\uc6b0\ud305 \u2014 \ubcf5\uc7a1/\uc815\ubc00 \uc5c5\ubb34\ub294 gpt-4o, \ub2e8\uc21c/\ube60\ub978 \uc5c5\ubb34\ub294 gpt-4o-mini
+EMP_MODELS = {
+    EMP_PLANNING:    "gpt-4o",       # \uc804\ub7b5 \uae30\ud68d \u2014 \ud488\uc9c8 \uc911\uc694
+    EMP_RESEARCH:    "gpt-4o",       # \ub9ac\uc11c\uce58 \u2014 \uae4a\uc774 \uc911\uc694
+    EMP_ANALYSIS:    "gpt-4o",       # \ub370\uc774\ud130 \ubd84\uc11d \u2014 \uc815\ud655\ub3c4 \uc911\uc694
+    EMP_QA:          "gpt-4o",       # \ud488\uc9c8 \uac80\uc218 \u2014 \uaf3c\uaf3c\ud568 \uc911\uc694
+    EMP_LEGAL:       "gpt-4o",       # \ubc95\ubb34 \u2014 \uc815\ud655\ub3c4 \ucd5c\uc911\uc694
+    EMP_DEVELOPMENT: "gpt-4o",       # \uac1c\ubc1c \u2014 \ucf54\ub4dc \ud488\uc9c8 \uc911\uc694
+    EMP_TRANSLATION: "gpt-4o-mini",  # \ubc88\uc5ed \u2014 \ube60\ub978 \ucc98\ub9ac \uac00\ub2a5
+    EMP_ADMIN:       "gpt-4o-mini",  # \ucd1d\ubb34 \u2014 \ub2e8\uc21c \ubb38\uc11c \uc791\uc5c5
+    EMP_DEPLOYMENT:  "gpt-4o-mini",  # \ubc30\ud3ec \u2014 \uccb4\ud06c\ub9ac\uc2a4\ud2b8 \uc704\uc8fc
+    EMP_GROWTH:      "gpt-4o-mini",  # \uc9d1\ud589 \u2014 \ub9c8\ucf00\ud305 \uce74\ud53c
+}
+
 EMP_AREA = {
     EMP_PLANNING: "employee_planning",
     EMP_RESEARCH: "employee_research",
@@ -374,6 +392,13 @@ def init_db() -> None:
                 last_triggered_at TEXT,
                 trigger_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS office_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL UNIQUE,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             """
         )
@@ -1214,28 +1239,88 @@ def read_project_file(path: str) -> str:
         return f"[read_project_file 오류] {exc}"
 
 
+def save_memory(key: str, value: str) -> str:
+    """중요한 정보를 장기 메모리에 저장합니다. 세션이 바뀌어도 유지됩니다."""
+    safe_key = key.strip()[:120]
+    safe_val = value.strip()[:4000]
+    if not safe_key:
+        return "[save_memory 오류] key가 비어있습니다."
+    init_db()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO office_memory (key, value, updated_at) VALUES (?, ?, ?)",
+            (safe_key, safe_val, utc_now()),
+        )
+    return f"[save_memory] '{safe_key}' 저장 완료."
+
+
+def load_memories(query: str = "") -> str:
+    """저장된 장기 메모리를 불러옵니다. query로 필터링 가능."""
+    init_db()
+    with get_db() as conn:
+        if query.strip():
+            rows = conn.execute(
+                "SELECT key, value, updated_at FROM office_memory WHERE key LIKE ? OR value LIKE ? ORDER BY updated_at DESC LIMIT 15",
+                (f"%{query}%", f"%{query}%"),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT key, value, updated_at FROM office_memory ORDER BY updated_at DESC LIMIT 15"
+            ).fetchall()
+    if not rows:
+        return "[load_memories] 저장된 메모리가 없습니다."
+    lines = [f"[{r['updated_at'][:10]}] {r['key']}: {r['value'][:200]}" for r in rows]
+    return "[저장된 메모리]\n" + "\n".join(lines)
+
+
 def search_web(query: str) -> str:
-    """Search the web for real-time information using DuckDuckGo."""
+    """Search the web for real-time information. Uses DuckDuckGo instant + HTML fallback."""
+    results: list[str] = []
+
+    # ① DuckDuckGo Instant Answer API
     try:
         params = urllib.parse.urlencode({"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
         req = urllib.request.Request(
             f"https://api.duckduckgo.com/?{params}",
             headers={"User-Agent": "Mozilla/5.0 fizzylush-ai-office/1.0"},
         )
-        with urllib.request.urlopen(req, timeout=10) as res:
+        with urllib.request.urlopen(req, timeout=8) as res:
             data = json.loads(res.read().decode("utf-8"))
-        results: list[str] = []
         abstract = (data.get("AbstractText") or "").strip()
         if abstract:
-            results.append(f"요약: {abstract}")
-        for item in (data.get("RelatedTopics") or [])[:5]:
+            results.append(f"[요약] {abstract[:400]}")
+        for item in (data.get("RelatedTopics") or [])[:4]:
             if isinstance(item, dict) and item.get("Text"):
-                results.append(f"- {str(item['Text'])[:200]}")
-        if not results:
-            return f"[search_web] '{query}'에 대한 결과를 찾지 못했습니다."
-        return f"[search_web 결과] '{query}'\n" + "\n".join(results)
-    except Exception as exc:
-        return f"[search_web 오류] {exc}"
+                results.append(f"- {str(item['Text'])[:220]}")
+    except Exception:
+        pass
+
+    # ② DuckDuckGo HTML 검색 결과 파싱 (fallback)
+    if not results:
+        try:
+            enc_q = urllib.parse.quote_plus(query)
+            req2 = urllib.request.Request(
+                f"https://html.duckduckgo.com/html/?q={enc_q}",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept-Language": "ko-KR,ko;q=0.9",
+                },
+            )
+            with urllib.request.urlopen(req2, timeout=10) as res:
+                html = res.read().decode("utf-8", errors="ignore")
+            # 간단한 텍스트 추출 (result__snippet 클래스)
+            import re as _re
+            snippets = _re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, _re.S)
+            for s in snippets[:5]:
+                clean = _re.sub(r"<[^>]+>", "", s).strip()
+                if clean:
+                    results.append(f"- {clean[:220]}")
+        except Exception:
+            pass
+
+    if not results:
+        return f"[search_web] '{query}' — 검색 결과를 가져오지 못했습니다. 다른 키워드로 시도해보세요."
+    return f"[search_web 결과] 검색어: '{query}'\n" + "\n".join(results[:6])
 
 
 def propose_office_action(
@@ -1457,6 +1542,37 @@ tool_definitions = [
     {
         "type": "function",
         "function": {
+            "name": "save_memory",
+            "description": "Save important information to long-term memory. Persists across sessions. Use for key decisions, user preferences, project context, or anything worth remembering.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Short memorable key, e.g. '마케팅_전략_2025Q2'"},
+                    "value": {"type": "string", "description": "The information to remember."},
+                },
+                "required": ["key", "value"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_memories",
+            "description": "Retrieve stored long-term memories. Use at the start of tasks to recall past context. Filter by keyword.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Filter keyword. Leave blank to get all memories."},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "propose_office_action",
             "description": "Create an approval-gated action for code changes, tests, builds, deploys, store submissions, ads, customer messages, legal review, or production data changes.",
             "parameters": {
@@ -1502,6 +1618,8 @@ available_functions = {
     "create_launch_checklist": create_launch_checklist,
     "save_business_doc": save_business_doc,
     "propose_office_action": propose_office_action,
+    "save_memory": save_memory,
+    "load_memories": load_memories,
 }
 
 
@@ -1781,12 +1899,16 @@ def run_employee(
     emp = employees[emp_key]
     tool_logs: list[dict[str, str]] = []
 
+    # Pull relevant long-term memories to give employee context
+    memories_context = load_memories(task[:60])
+    memory_section = f"\n[장기 메모리]\n{memories_context}" if "없습니다" not in memories_context else ""
+
     work_prompt = f"""
 Original user command:
 {task}
 
 Previous employee result or current context:
-{current_context}
+{current_context}{memory_section}
 
 {REACT_INSTRUCTIONS}
 
@@ -1801,6 +1923,8 @@ Available tools:
 - save_business_doc: 문서 저장
 - ask_colleague: 다른 직원에게 질문/협업 요청
 - propose_office_action: 승인 필요 액션 등록
+- save_memory: 중요한 정보를 장기 메모리에 저장 (세션 간 유지)
+- load_memories: 저장된 장기 메모리 조회
 
 Guardrail:
 실제 배포, 유료 광고, 고객 메시지, 법적 게시, 프로덕션 DB 변경은 창업자 승인 필요.
@@ -1820,7 +1944,7 @@ Always answer in Korean.
         {"role": "user", "content": work_prompt},
     ]
 
-    model = "gpt-4o-mini"
+    model = EMP_MODELS.get(emp_key, "gpt-4o-mini")
     completed = False
 
     for iteration in range(REACT_MAX_ITERATIONS):
@@ -2175,23 +2299,72 @@ def list_office_actions(limit: int = 100):
     return {"actions": [dict(row) for row in rows]}
 
 
+_ACTION_TYPE_TO_EMPLOYEE: dict[str, str] = {
+    "code": EMP_DEVELOPMENT,
+    "test": EMP_DEVELOPMENT,
+    "build": EMP_DEPLOYMENT,
+    "deploy": EMP_DEPLOYMENT,
+    "store_submit": EMP_DEPLOYMENT,
+    "ads": EMP_GROWTH,
+    "customer_message": EMP_GROWTH,
+    "legal": EMP_LEGAL,
+    "data": EMP_ANALYSIS,
+    "doc": EMP_PLANNING,
+    "general": EMP_PLANNING,
+}
+
+
+def _execute_approved_action(action_id: int, action_type: str, title: str, detail: str, command: str) -> None:
+    """Background thread: runs the appropriate AI employee to produce a real result for the approved action."""
+    emp_key = _ACTION_TYPE_TO_EMPLOYEE.get(action_type, EMP_PLANNING)
+    task = (
+        f"[승인된 액션 실행]\n"
+        f"액션 유형: {action_type}\n"
+        f"제목: {title}\n"
+        f"상세 내용:\n{detail}\n"
+        + (f"\n실행 명령/지시:\n{command}" if command else "")
+        + "\n\n위 내용을 실제로 실행하거나 구체적인 결과물을 작성하세요. "
+        "코드라면 실제 코드를, 문서라면 완성된 문서를, 계획이라면 즉시 실행 가능한 단계별 계획을 제공하세요."
+    )
+    try:
+        result, _tool_logs = run_employee(emp_key, task, detail, [], f"action_{action_id}", "system")
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE office_actions SET status = 'completed', completed_at = ?, result = ? WHERE id = ?",
+                (utc_now(), result[:4000], action_id),
+            )
+        log_office_event("action_executed", f"Action #{action_id} executed by {employees[emp_key]['name']}", result[:300])
+    except Exception as exc:
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE office_actions SET status = 'failed', result = ? WHERE id = ?",
+                (f"실행 오류: {exc}", action_id),
+            )
+        log_office_event("action_failed", f"Action #{action_id} execution failed: {exc}")
+
+
 @app.post("/office/actions/{action_id}/approve")
 def approve_office_action(action_id: int):
     init_db()
     with get_db() as conn:
-        row = conn.execute("SELECT id, title FROM office_actions WHERE id = ?", (action_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, action_type, title, detail, command FROM office_actions WHERE id = ?",
+            (action_id,),
+        ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Office action not found")
         conn.execute(
-            """
-            UPDATE office_actions
-            SET status = 'approved', approved_at = ?
-            WHERE id = ?
-            """,
+            "UPDATE office_actions SET status = 'executing', approved_at = ? WHERE id = ?",
             (utc_now(), action_id),
         )
-    log_office_event("action_approved", f"Action #{action_id} approved")
-    return {"ok": True, "id": action_id, "status": "approved"}
+    log_office_event("action_approved", f"Action #{action_id} approved — executing now")
+    t = threading.Thread(
+        target=_execute_approved_action,
+        args=(row["id"], row["action_type"], row["title"], row["detail"], row["command"] or ""),
+        daemon=True,
+    )
+    t.start()
+    return {"ok": True, "id": action_id, "status": "executing", "message": "승인 완료. AI 직원이 실행 중입니다."}
 
 
 @app.post("/office/actions/{action_id}/complete")
